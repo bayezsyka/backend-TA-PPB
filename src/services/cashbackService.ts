@@ -1,3 +1,4 @@
+// src/services/cashbackService.ts
 import { supabase } from "../supabaseClient";
 import { firstDayOfNextMonth } from "../utils/date";
 
@@ -35,14 +36,44 @@ export async function getUsableCashbackBalance(memberId: string, at: any) {
   return totalEarn + totalSpend;
 }
 
+export async function getPendingCashbackBalance(memberId: string, at: any) {
+  const today = at.toISODate();
+
+  // cashback yang SUDAH di-earn tapi usable_from-nya MASIH DI DEPAN (bulan depan dst)
+  const { data: earns, error } = await supabase
+    .from("cashback_ledger")
+    .select("amount")
+    .eq("member_id", memberId)
+    .eq("entry_type", "earn")
+    .gt("usable_from", today);
+
+  if (error) throw error;
+
+  const totalEarn = (earns || []).reduce(
+    (sum, r: any) => sum + (r.amount || 0),
+    0
+  );
+
+  return totalEarn;
+}
+
 export async function calculateCashbackForTransaction(params: {
   memberId: string;
   paidCash: number;
   at: any;
 }) {
   const { memberId, paidCash, at } = params;
-  if (paidCash <= 0) return { earned: 0 };
 
+  if (paidCash < 15000) {
+    return { earned: 0, detail: [] as any[] };
+  }
+
+  const MULTIPLE = 15000;
+  const PER_MULTIPLE_CB = 2500;
+  const DAILY_MAX = 5000;
+
+  // cek dulu hari ini sudah dapat cashback berapa
+  const dayKey = at.toISODate();
   const dayStart = at.startOf("day").toISO();
   const dayEnd = at.endOf("day").toISO();
 
@@ -59,25 +90,43 @@ export async function calculateCashbackForTransaction(params: {
     (sum, r: any) => sum + (r.paid_cash || 0),
     0
   );
-  const prevCashbackEarned = (rows || []).reduce(
+  const prevEarned = (rows || []).reduce(
     (sum, r: any) => sum + (r.cashback_earned || 0),
     0
   );
 
-  const newTotalCash = prevCashPaid + paidCash;
+  const todayCashPaid = prevCashPaid + paidCash;
 
-  // Aturan:
-  // tiap 15.000 → 2.500, minimal 15.000, maksimal 5.000 per hari
-  const step = 15000;
-  const rewardPerStep = 2500;
-  const maxDaily = 5000;
+  const multiples = Math.floor(todayCashPaid / MULTIPLE);
+  const theoreticalEarn = multiples * PER_MULTIPLE_CB;
 
-  const unitCount = Math.floor(newTotalCash / step);
-  const possibleTotal = Math.min(unitCount * rewardPerStep, maxDaily);
+  let earned = theoreticalEarn - prevEarned;
+  if (earned < 0) {
+    earned = 0;
+  }
 
-  const earnedNow = Math.max(0, possibleTotal - prevCashbackEarned);
+  const remainingLimit = DAILY_MAX - prevEarned;
+  if (remainingLimit <= 0) {
+    earned = 0;
+  } else if (earned > remainingLimit) {
+    earned = remainingLimit;
+  }
 
-  return { earned: earnedNow };
+  if (earned < 0) earned = 0;
+
+  return {
+    earned,
+    detail: [
+      {
+        rule: "15k-per-multiple",
+        multiples,
+        dailyLimit: DAILY_MAX,
+        prevEarned,
+        finalEarned: earned,
+        dayKey,
+      },
+    ],
+  };
 }
 
 export async function addCashbackEarnEntry(params: {
